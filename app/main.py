@@ -7,6 +7,7 @@ import datetime as dt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
+from .alarms import AlarmError, Reminder, expand_alarms
 from .availability import (
     WEEKDAY_NAMES,
     AvailabilityError,
@@ -22,10 +23,11 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.2.0",
+    version="1.3.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
-    "into concrete UTC instances, and intersect named calendars with "
-    "local working hours to find common free time.",
+    "into concrete UTC instances, intersect named calendars with "
+    "local working hours to find common free time, and expand VALARM "
+    "reminders for the instances inside a query window.",
 )
 
 
@@ -69,6 +71,44 @@ class ExpandResponse(BaseModel):
     window_end: dt.datetime
     count: int
     instances: list[InstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /alarms
+# ---------------------------------------------------------------------------
+
+
+class AlarmsRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to scan for alarms")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the query window (ISO 8601, converted to UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the query window (ISO 8601, converted to UTC)"
+    )
+
+
+class AlarmOut(BaseModel):
+    uid: str
+    recurrence_id: dt.datetime | None
+    summary: str | None
+    trigger: dt.datetime
+    description: str
+
+    @field_serializer("recurrence_id", "trigger")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _iso_z(value)
+
+
+class AlarmsResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    count: int
+    alarms: list[AlarmOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -172,6 +212,16 @@ def _instance_out(instance: Instance) -> InstanceOut:
     )
 
 
+def _alarm_out(reminder: Reminder) -> AlarmOut:
+    return AlarmOut(
+        uid=reminder.uid,
+        recurrence_id=reminder.recurrence_id,
+        summary=reminder.summary,
+        trigger=reminder.trigger,
+        description=reminder.description,
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /calendar-diff
 # ---------------------------------------------------------------------------
@@ -229,6 +279,26 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_end=window_end,
         count=len(instances),
         instances=[_instance_out(i) for i in instances],
+    )
+
+
+@app.post("/alarms", response_model=AlarmsResponse)
+def alarms(request: AlarmsRequest) -> AlarmsResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        reminders = expand_alarms(request.ics, window_start, window_end)
+    except (ExpansionError, AlarmError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AlarmsResponse(
+        window_start=window_start,
+        window_end=window_end,
+        count=len(reminders),
+        alarms=[_alarm_out(r) for r in reminders],
     )
 
 

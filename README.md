@@ -16,6 +16,9 @@ local working hours.
 - `/calendar-diff` compares two ICS versions over one UTC window by
   `UID + RECURRENCE-ID` and returns identity-sorted `added`/`removed`/
   `modified` instances (with `before`/`after`)
+- `/alarms` expands `VALARM` reminders for every instance in a window:
+  a master event's alarms apply to each recurring instance, overrides
+  carry their own, and `REPEAT`/`DURATION` fan alarms out
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -256,6 +259,99 @@ unchanged March 2/16/23 standups are not reported:
 }
 ```
 
+### `POST /alarms`
+
+Expands the `VALARM` reminders of every `VEVENT` instance that overlaps the
+query window, returning only reminders whose **trigger instant** falls
+inside `[window_start, window_end)`. Request body is the same shape as
+`/expand`:
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)             |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+
+Alarm semantics:
+
+- Only `ACTION:DISPLAY` alarms are supported (`AUDIO`, `EMAIL`, … → `422`);
+  a `DESCRIPTION` is required.
+- `TRIGGER` may be **absolute** (`VALUE=DATE-TIME`, optionally with a
+  `TZID`; a floating value is assumed UTC) or a **duration** relative to
+  the instance start (`TRIGGER:-PT15M`) or end
+  (`TRIGGER;RELATED=END:PT10M`). Both positive and negative durations are
+  accepted; `RELATED=START` is the default.
+- `REPEAT` plus `DURATION` (the pair must appear together) fans one alarm
+  out into `REPEAT + 1` reminders, spaced by `DURATION` (e.g.
+  `REPEAT:2`/`DURATION:PT5M` fires at the initial trigger and twice more,
+  five minutes apart). `REPEAT` must be non-negative and `DURATION`
+  positive; a single alarm may not fan out beyond 1000 reminders.
+- A **master** event's alarms apply to *every* expanded instance of the
+  series; a `RECURRENCE-ID` override carries **its own** alarms and the
+  master's alarms do not apply to it (an override without `VALARM`s alarms
+  nobody). A cancelled occurrence produces no reminders.
+- The window is half-open: a trigger exactly at `window_start` is included,
+  one exactly at `window_end` is excluded.
+
+Each reminder carries `uid`, `recurrence_id` (UTC, `null` for
+non-recurring events), `summary` (of the instance it belongs to), `trigger`
+(UTC, `Z`), and the alarm `description`. Reminders are stably sorted by
+trigger time, then `UID`, then `RECURRENCE-ID` (a `null` `RECURRENCE-ID`
+sorts first).
+
+### Example
+
+```bash
+curl -s http://localhost:8000/alarms \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:weekly-1\r\nDTSTART:20260105T090000Z\r\nDTEND:20260105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=2\r\nSUMMARY:Weekly sync\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nDESCRIPTION:Join the call\r\nREPEAT:1\r\nDURATION:PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-02-01T00:00:00Z"
+  }'
+```
+
+The one master alarm applies to both Mondays and repeats once ten minutes
+after the initial trigger:
+
+```json
+{
+  "window_start": "2026-01-01T00:00:00Z",
+  "window_end": "2026-02-01T00:00:00Z",
+  "count": 4,
+  "alarms": [
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-05T09:00:00Z",
+      "summary": "Weekly sync",
+      "trigger": "2026-01-05T08:45:00Z",
+      "description": "Join the call"
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-05T09:00:00Z",
+      "summary": "Weekly sync",
+      "trigger": "2026-01-05T08:55:00Z",
+      "description": "Join the call"
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-12T09:00:00Z",
+      "summary": "Weekly sync",
+      "trigger": "2026-01-12T08:45:00Z",
+      "description": "Join the call"
+    },
+    {
+      "uid": "weekly-1",
+      "recurrence_id": "2026-01-12T09:00:00Z",
+      "summary": "Weekly sync",
+      "trigger": "2026-01-12T08:55:00Z",
+      "description": "Join the call"
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -273,6 +369,18 @@ non-positive `minimum_minutes`.
 returns `422` when `window_start >= window_end` or when either `old_ics` or
 `new_ics` fails any of the `/expand` checks above.
 
+`/alarms` additionally returns `422` for: an `ACTION` other than
+`DISPLAY` (or a missing `ACTION`), a `DISPLAY` alarm without
+`DESCRIPTION`, a missing or unsupported `TRIGGER` (only `DURATION` and
+`DATE-TIME` values are supported; `RELATED` other than `START`/`END`, or
+`RELATED` on an absolute trigger), exactly one of `REPEAT`/`DURATION`
+present, a negative `REPEAT`, a non-positive alarm `DURATION`, a fan-out
+beyond 1000 reminders, or an unknown `TZID` on an absolute trigger. All
+`VALARM`s are validated eagerly, so an unsupported alarm yields `422`
+even when its trigger lies outside the window; calendar-level failures
+(unparsable ICS, bad window, invalid recurrence) reuse the `/expand`
+checks.
+
 ## Semantics and limitations
 
 - **Window overlap**: an instance is included when
@@ -288,6 +396,26 @@ returns `422` when `window_start >= window_end` or when either `old_ics` or
 - `RDATE`/`EXDATE` support `DATE` and `DATE-TIME` values (not `PERIOD`);
   `RECURRENCE-ID` with `RANGE=THISANDFUTURE` is not supported.
 - A master event with `STATUS:CANCELLED` suppresses its whole series.
+
+### Alarm semantics
+
+- **Instance binding**: a master `VEVENT`'s `VALARM`s apply to every
+  instance the recurrence engine expands from it; a `RECURRENCE-ID`
+  override replaces the master's alarms for that instance with its own
+  (an override with no `VALARM`s has no reminders). Cancelled instances
+  and `EXDATE`d occurrences never produce reminders.
+- **Triggers**: a duration-valued `TRIGGER` is added to the instance's
+  DTSTART (default / `RELATED=START`) or DTEND (`RELATED=END`); signed
+  durations point before (negative) or after (positive) the anchor. An
+  absolute `TRIGGER;VALUE=DATE-TIME` is independent of the instance time
+  and is normalized with its `Z`/`TZID` (floating = UTC).
+- **Repeats**: `REPEAT:n` plus `DURATION:d` produces `n + 1` triggers at
+  `base, base+d, …, base+n*d`. Reminders are filtered afterwards, so only
+  the ones landing in the half-open window are returned.
+- **Eager validation**: every `VALARM` in the supplied calendar is
+  validated regardless of whether its event or trigger intersects the
+  window; an unsupported or malformed alarm fails the whole request with
+  `422`. Events without any `VALARM` simply contribute no reminders.
 
 ### Availability semantics
 
@@ -323,9 +451,10 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /calendar-diff,
-                     POST /availability, GET /health
+app/main.py          FastAPI app: POST /expand, POST /alarms,
+                     POST /calendar-diff, POST /availability, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 tests/               key tests for all endpoints (recurrences, DST, 422s)

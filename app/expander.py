@@ -10,7 +10,7 @@ so DST transitions are honored automatically.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.rrule import rruleset, rrulestr
@@ -35,6 +35,10 @@ class Instance:
     end: dt.datetime  # aware UTC
     summary: str | None
     status: str
+    # Raw icalendar VALARM components carried by the event that produced
+    # this instance: a master's alarms apply to every recurring instance,
+    # while a RECURRENCE-ID override uses only its own (possibly empty).
+    alarms: list = field(default_factory=list)
 
 
 def expand_calendar(
@@ -43,7 +47,13 @@ def expand_calendar(
     """Expand all VEVENTs in ``ics_text`` and return instances overlapping
     the UTC window [window_start, window_end), sorted by (start, uid, rid)."""
     calendar = _parse_calendar(ics_text)
+    return expand_parsed_calendar(calendar, window_start, window_end)
 
+
+def expand_parsed_calendar(
+    calendar: Calendar, window_start: dt.datetime, window_end: dt.datetime
+) -> list[Instance]:
+    """Like :func:`expand_calendar` but for an already parsed calendar."""
     groups: dict[str, list] = {}
     for component in calendar.walk("VEVENT"):
         uid = component.get("UID")
@@ -85,6 +95,7 @@ def _expand_group(
         master_summary = _text(master, "SUMMARY")
         m_start, m_end = _event_times(master)
         master_duration = m_end - m_start
+        master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
         if _status(master) != "CANCELLED":
             occurrences, recurring = _expand_master(
                 master, m_start, master_duration, window_start, window_end
@@ -98,6 +109,7 @@ def _expand_group(
                     end=start + master_duration,
                     summary=master_summary,
                     status=_status(master),
+                    alarms=master_alarms,
                 )
 
     for override in overrides:
@@ -117,6 +129,7 @@ def _expand_group(
             end=_to_utc(end),
             summary=summary if summary is not None else master_summary,
             status=status,
+            alarms=[c for c in override.subcomponents if c.name == "VALARM"],
         )
 
     return list(instances.values())
