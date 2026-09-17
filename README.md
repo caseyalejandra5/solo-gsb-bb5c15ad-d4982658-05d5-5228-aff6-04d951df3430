@@ -1,15 +1,19 @@
 # iCalendar Recurrence Expansion & Availability API
 
 A local HTTP API that expands iCalendar (RFC 5545) recurring events into
-concrete UTC instances inside a query window, and finds the **common free
-time** across several named calendars when intersected with per-weekday
-local working hours.
+concrete UTC instances inside a query window, expands their `VALARM`
+reminders, and finds the **common free time** across several named
+calendars when intersected with per-weekday local working hours.
 
 - Expands `DTSTART` + `RRULE` + `RDATE` − `EXDATE`
 - Merges overrides by `UID` + `RECURRENCE-ID`: an override can **reschedule**
   an instance (judged against the window by its *actual* new start/end; the
   original slot is never kept) or **cancel** it via `STATUS:CANCELLED`
 - Interprets `TZID` as IANA timezones with correct DST handling
+- `/alarms` expands `VALARM` reminders for every instance in the window:
+  the master event's alarms fire for each occurrence, an override event
+  uses its own alarms; supports `ACTION:DISPLAY`, absolute and
+  DTSTART/DTEND-relative `TRIGGER`s, and `REPEAT`/`DURATION` repetitions
 - `/availability` builds working hours per **local date** (DST-correct),
   clips all busy instances to them, merges half-open intervals (adjacent
   included), and returns the complement shared by every calendar
@@ -17,7 +21,8 @@ local working hours.
   `UID + RECURRENCE-ID` and returns identity-sorted `added`/`removed`/
   `modified` instances (with `before`/`after`)
 - Results sorted by UTC start time, then `UID` (stable)
-- Clear `422` errors for invalid rules, unknown timezones, or bad input
+- Clear `422` errors for invalid rules, unknown timezones, unsupported
+  alarms, or bad input
 
 Stack: Python · FastAPI · icalendar · python-dateutil · zoneinfo
 
@@ -84,6 +89,88 @@ the new time (the original slot is gone):
       "start": "2026-03-16T15:00:00Z",
       "end": "2026-03-16T16:00:00Z",
       "status": "CONFIRMED"
+    }
+  ]
+}
+```
+
+### `POST /alarms`
+
+Expands the `VEVENT`s of one calendar inside a UTC window (same rules as
+`/expand`) and computes the `VALARM` reminders of every resulting
+instance. Request body (identical to `/expand`):
+
+| Field          | Type   | Description                                        |
+| -------------- | ------ | -------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)             |
+| `window_start` | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+| `window_end`   | string | ISO 8601 timestamp, converted to UTC (naive = UTC) |
+
+Alarm semantics:
+
+- The **master** event's `VALARM`s fire for every expanded occurrence of
+  its recurrence set; an **override** (`RECURRENCE-ID`) event uses its own
+  `VALARM`s only — an override without alarms silences that instance, and
+  a cancelled instance has no reminders.
+- Supported triggers: absolute `TRIGGER;VALUE=DATE-TIME` (naive values are
+  read as UTC) and relative durations anchored at `DTSTART` (default or
+  `RELATED=START`) or `DTEND` (`RELATED=END`), positive or negative.
+- `REPEAT` + `DURATION` (which must occur together) add `REPEAT` extra
+  reminders, each spaced `DURATION` after the previous one.
+- Only reminders whose trigger time falls inside the half-open window
+  `[window_start, window_end)` are returned; the event itself must overlap
+  the window to be expanded at all.
+- Each reminder carries `uid`, `recurrence_id` (UTC, `null` for
+  non-recurring events), `summary`, `trigger` (UTC), and `description`
+  (`null` when the alarm has none), sorted by trigger time, then `UID`,
+  then `RECURRENCE-ID` (stable).
+- Anything else is rejected with `422`: non-`DISPLAY` actions, missing
+  `ACTION`/`TRIGGER`, unsupported trigger value types or `RELATED`
+  anchors, `REPEAT` without `DURATION` (or vice versa), negative or
+  excessive `REPEAT` (limit 10 000), and non-positive `DURATION`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/alarms \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:standup\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T091500Z\r\nRRULE:FREQ=DAILY;COUNT=2\r\nSUMMARY:Standup\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT10M\r\nDESCRIPTION:Starts soon\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:standup\r\nRECURRENCE-ID:20260303T090000Z\r\nDTSTART:20260303T100000Z\r\nDTEND:20260303T101500Z\r\nSUMMARY:Standup (moved)\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:PT5M\r\nREPEAT:1\r\nDURATION:PT5M\r\nDESCRIPTION:Wrap up\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-03-01T00:00:00Z",
+    "window_end": "2026-03-04T00:00:00Z"
+  }'
+```
+
+The master's alarm fires 10 minutes before each occurrence it still owns;
+the moved March 3 instance uses only the override's own alarm (5 minutes
+after its new end, repeated once after 5 more minutes):
+
+```json
+{
+  "window_start": "2026-03-01T00:00:00Z",
+  "window_end": "2026-03-04T00:00:00Z",
+  "count": 3,
+  "alarms": [
+    {
+      "uid": "standup",
+      "recurrence_id": "2026-03-02T09:00:00Z",
+      "summary": "Standup",
+      "trigger": "2026-03-02T08:50:00Z",
+      "description": "Starts soon"
+    },
+    {
+      "uid": "standup",
+      "recurrence_id": "2026-03-03T09:00:00Z",
+      "summary": "Standup (moved)",
+      "trigger": "2026-03-03T10:20:00Z",
+      "description": "Wrap up"
+    },
+    {
+      "uid": "standup",
+      "recurrence_id": "2026-03-03T09:00:00Z",
+      "summary": "Standup (moved)",
+      "trigger": "2026-03-03T10:25:00Z",
+      "description": "Wrap up"
     }
   ]
 }
@@ -264,6 +351,12 @@ text, invalid `RRULE` (e.g. `FREQ=BOGUS`), unknown `TZID`
 `RANGE=THISANDFUTURE` (unsupported), `window_start >= window_end`, and
 expansions exceeding 10 000 occurrences per UID within the window.
 
+`/alarms` additionally returns `422` for: a non-`DISPLAY` `ACTION`, a
+missing `ACTION`/`TRIGGER`, an unsupported `TRIGGER` value type (e.g.
+`VALUE=DATE`) or `RELATED` anchor, `REPEAT` without `DURATION` (or vice
+versa), a negative or excessive `REPEAT` (limit 10 000), and a
+non-positive `DURATION`.
+
 `/availability` additionally returns `422` for: an unknown `timezone`
 (non-IANA name), a working period with `end <= start` or crossing
 midnight, an offset-bearing working time, an unknown weekday key, and a
@@ -323,12 +416,13 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /calendar-diff,
-                     POST /availability, GET /health
+app/main.py          FastAPI app: POST /expand, POST /alarms,
+                     POST /calendar-diff, POST /availability, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/alarms.py        VALARM trigger/repeat expansion per expanded instance
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
-tests/               key tests for all endpoints (recurrences, DST, 422s)
+tests/               key tests for all endpoints (recurrences, alarms, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup
 ```

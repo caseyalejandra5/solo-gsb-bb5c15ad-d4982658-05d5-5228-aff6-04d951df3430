@@ -7,6 +7,7 @@ import datetime as dt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
+from .alarms import expand_alarms
 from .availability import (
     WEEKDAY_NAMES,
     AvailabilityError,
@@ -22,10 +23,11 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.2.0",
+    version="1.3.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
-    "into concrete UTC instances, and intersect named calendars with "
-    "local working hours to find common free time.",
+    "into concrete UTC instances, expand their VALARM reminders, and "
+    "intersect named calendars with local working hours to find common "
+    "free time.",
 )
 
 
@@ -207,6 +209,34 @@ class CalendarDiffResponse(BaseModel):
         return _iso_z(value)
 
 
+# ---------------------------------------------------------------------------
+# POST /alarms
+# ---------------------------------------------------------------------------
+
+
+class AlarmOut(BaseModel):
+    uid: str
+    recurrence_id: dt.datetime | None
+    summary: str | None
+    trigger: dt.datetime
+    description: str | None
+
+    @field_serializer("recurrence_id", "trigger")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _iso_z(value)
+
+
+class AlarmsResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    count: int
+    alarms: list[AlarmOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -257,6 +287,35 @@ def calendar_diff(request: CalendarDiffRequest) -> CalendarDiffResponse:
                 after=_instance_out(after),
             )
             for before, after in diff.modified
+        ],
+    )
+
+
+@app.post("/alarms", response_model=AlarmsResponse)
+def alarms(request: ExpandRequest) -> AlarmsResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        expanded = expand_alarms(request.ics, window_start, window_end)
+    except ExpansionError as exc:  # includes AlarmError
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AlarmsResponse(
+        window_start=window_start,
+        window_end=window_end,
+        count=len(expanded),
+        alarms=[
+            AlarmOut(
+                uid=alarm.uid,
+                recurrence_id=alarm.recurrence_id,
+                summary=alarm.summary,
+                trigger=alarm.trigger,
+                description=alarm.description,
+            )
+            for alarm in expanded
         ],
     )
 

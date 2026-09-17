@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.rrule import rruleset, rrulestr
-from icalendar import Calendar
+from icalendar import Calendar, Event
 
 UTC = dt.timezone.utc
 
@@ -42,6 +42,27 @@ def expand_calendar(
 ) -> list[Instance]:
     """Expand all VEVENTs in ``ics_text`` and return instances overlapping
     the UTC window [window_start, window_end), sorted by (start, uid, rid)."""
+    instances = [
+        instance
+        for instance, _event in expand_with_sources(
+            ics_text, window_start, window_end
+        )
+    ]
+    no_rid = dt.datetime.min.replace(tzinfo=UTC)
+    instances.sort(key=lambda i: (i.start, i.uid, i.recurrence_id or no_rid))
+    return instances
+
+
+def expand_with_sources(
+    ics_text: str, window_start: dt.datetime, window_end: dt.datetime
+) -> list[tuple[Instance, Event]]:
+    """Expand like :func:`expand_calendar`, but keep the source VEVENT.
+
+    Each item pairs an instance with the component it came from: the master
+    event for instances generated from the recurrence set, or the override
+    event for instances replaced via RECURRENCE-ID. Only instances
+    overlapping the window are returned, in no particular order.
+    """
     calendar = _parse_calendar(ics_text)
 
     groups: dict[str, list] = {}
@@ -51,16 +72,15 @@ def expand_calendar(
             raise ExpansionError("VEVENT is missing the required UID property")
         groups.setdefault(str(uid), []).append(component)
 
-    instances: list[Instance] = []
+    instances: list[tuple[Instance, Event]] = []
     for uid, events in groups.items():
         instances.extend(_expand_group(uid, events, window_start, window_end))
 
-    instances = [
-        i for i in instances if _overlaps(i.start, i.end, window_start, window_end)
+    return [
+        (instance, event)
+        for instance, event in instances
+        if _overlaps(instance.start, instance.end, window_start, window_end)
     ]
-    no_rid = dt.datetime.min.replace(tzinfo=UTC)
-    instances.sort(key=lambda i: (i.start, i.uid, i.recurrence_id or no_rid))
-    return instances
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +89,14 @@ def expand_calendar(
 
 def _expand_group(
     uid: str, events: list, window_start: dt.datetime, window_end: dt.datetime
-) -> list[Instance]:
+) -> list[tuple[Instance, Event]]:
     for event in events:
         _validate_tzids(event)
 
     masters = [e for e in events if "RECURRENCE-ID" not in e]
     overrides = [e for e in events if "RECURRENCE-ID" in e]
 
-    instances: dict[dt.datetime, Instance] = {}
+    instances: dict[dt.datetime, tuple[Instance, Event]] = {}
     master_summary: str | None = None
     master_duration: dt.timedelta | None = None
 
@@ -91,13 +111,16 @@ def _expand_group(
             )
             for occ in occurrences:
                 start = _to_utc(occ)
-                instances[start] = Instance(
-                    uid=uid,
-                    recurrence_id=start if recurring else None,
-                    start=start,
-                    end=start + master_duration,
-                    summary=master_summary,
-                    status=_status(master),
+                instances[start] = (
+                    Instance(
+                        uid=uid,
+                        recurrence_id=start if recurring else None,
+                        start=start,
+                        end=start + master_duration,
+                        summary=master_summary,
+                        status=_status(master),
+                    ),
+                    master,
                 )
 
     for override in overrides:
@@ -110,13 +133,16 @@ def _expand_group(
             continue
         start, end = _event_times(override, default_duration=master_duration)
         summary = _text(override, "SUMMARY")
-        instances[rid] = Instance(
-            uid=uid,
-            recurrence_id=rid,
-            start=_to_utc(start),
-            end=_to_utc(end),
-            summary=summary if summary is not None else master_summary,
-            status=status,
+        instances[rid] = (
+            Instance(
+                uid=uid,
+                recurrence_id=rid,
+                start=_to_utc(start),
+                end=_to_utc(end),
+                summary=summary if summary is not None else master_summary,
+                status=status,
+            ),
+            override,
         )
 
     return list(instances.values())
